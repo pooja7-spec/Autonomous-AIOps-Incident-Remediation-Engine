@@ -33,7 +33,7 @@ public class IncidentOrchestrator {
             return save(alert, IncidentStatus.HEALTHY, detection, null);
         }
 
-        Optional<RootCauseAnalysis> rootCause = identifierSkill.analyze(alert);
+        Optional<RootCauseAnalysis> rootCause = identifierSkill.analyze(alert, detection);
         IncidentStatus status = rootCause.isPresent()
                 ? IncidentStatus.ROOT_CAUSE_IDENTIFIED
                 : IncidentStatus.NEEDS_INVESTIGATION;

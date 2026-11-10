@@ -8,9 +8,11 @@ relevant log and source-control evidence through tool boundaries, detects
 degradation, and returns a root-cause hypothesis with a proposed recovery action.
 The output is advisory; the system does not change code or deploy a fix.
 
-The current Java project is a local MVP. Its in-memory adapters and deterministic
-analysis are runnable examples, not live Kafka, Elasticsearch, GitHub, MCP, or
-LLM integrations.
+The current Java project is a local MVP. Its in-memory log and Git adapters are
+demo implementations, not live Kafka, Elasticsearch, or GitHub integrations.
+It supports deterministic `demo` mode and an optional OpenAI-backed `openai`
+mode. OpenAI mode uses host-executed function tools; it is not itself an MCP
+server and does not add live log-store or GitHub integrations.
 
 ## 2. Core system design and workflow
 
@@ -35,19 +37,22 @@ LLM integrations.
 ### Current MVP flow
 
 The Java application accepts a metric alert at `POST /api/incidents/trigger`.
-`IncidentOrchestrator` invokes `DetectionSkill`, which queries the
-`LogQueryTool` for up to 20 `ERROR` or `CRITICAL` log entries in a configurable
-five-minute window. A threshold breach or relevant error log marks the report
-unhealthy. The orchestrator then calls `IdentifierSkill`, which asks
-`GitDiffTool` for changes in the service repository from the preceding hour.
-The newest returned change is a hypothesis, not a proven cause. Reports are
-stored in process memory and are lost when the service restarts.
+`IncidentOrchestrator` invokes `DetectionSkill`. In demo mode, it deterministically
+queries up to 20 `ERROR` or `CRITICAL` entries. In OpenAI mode, the model calls
+the host-provided `query_system_logs` tool, the host queries `LogQueryTool`, and
+the model returns schema-constrained health JSON. If the result is unhealthy,
+`IdentifierSkill` similarly provides `get_recent_commit_diffs`; the host queries
+`GitDiffTool` and the model returns structured analysis. The host verifies that
+the commit and files came from the tool results. A recent change remains a
+hypothesis, not a proven cause. Reports are stored in process memory and are
+lost when the service restarts.
 
 ## 3. Tool contracts
 
-These are proposed MCP-style contracts for future host/model integration. The
-current project exposes equivalent Java interfaces, but does not implement the
-MCP protocol or connect to a real log or Git service.
+These are MCP-style contracts for possible future MCP integration. OpenAI mode
+uses equivalent OpenAI function-calling definitions over the existing Java
+interfaces. The project does not implement the MCP protocol or connect to a real
+log or Git service.
 
 ### Log query tool
 
@@ -61,10 +66,7 @@ MCP protocol or connect to a real log or Git service.
     "properties": {
       "service": { "type": "string" },
       "lookback_minutes": { "type": "integer", "minimum": 1, "maximum": 60 },
-      "min_severity": {
-        "type": "string",
-        "enum": ["INFO", "WARN", "ERROR", "CRITICAL"]
-      }
+      "min_severity": { "type": "string", "enum": ["ERROR", "CRITICAL"] }
     },
     "required": ["service", "lookback_minutes", "min_severity"]
   }
@@ -73,7 +75,9 @@ MCP protocol or connect to a real log or Git service.
 
 In the MVP, `LogQueryTool.queryLogs(service, lookbackMinutes, minimumSeverity)`
 is implemented by `InMemoryLogQueryTool`. It filters by service, time, and
-severity, sorts newest first, and returns at most 20 entries.
+severity, sorts newest first, and returns at most 20 entries. In OpenAI mode,
+the host further truncates each message to 2,000 characters before returning
+the query result to the model.
 
 ### Recent Git diff tool
 
@@ -97,13 +101,14 @@ In the MVP, `GitDiffTool.getRecentCommitDiffs(serviceRepository,
 sinceTimestamp)` is implemented by `InMemoryGitDiffTool`. A production adapter
 must authorize repositories, bound the number and size of diffs, and avoid
 exposing unrelated source code or secrets.
+OpenAI mode limits each response to five changes, 50 paths and 4,000 diff
+characters per change; commit messages are capped at 500 characters.
 
 ## 4. Skill prompting and structured outputs
 
-The current skills use deterministic Java logic so the project can run without
-model credentials. The following prompt outlines are intended for a future
-LLM-backed implementation. Tool execution must remain in the host, with only
-relevant, bounded results returned to the model.
+Demo mode uses deterministic Java logic. OpenAI mode uses the following prompt
+behavior with host-executed tools and schema-constrained JSON. Tool execution
+remains in the host and only relevant, bounded results are returned to the model.
 
 ### Detection stage prompt outline
 
@@ -113,20 +118,12 @@ relevant, bounded results returned to the model.
 > Treat the metric alert as evidence. Return only JSON matching the configured
 > detection schema; do not include conversational text.
 
-Expected output shape:
+The model response shape is:
 
 ```json
 {
   "isHealthy": false,
-  "summary": "Database connection errors coincide with the elevated 5xx rate.",
-  "evidence": [
-    {
-      "timestamp": "2026-11-09T17:30:00Z",
-      "severity": "ERROR",
-      "service": "payment-service",
-      "message": "Database connection pool exhausted"
-    }
-  ]
+  "summary": "Database connection errors coincide with the elevated 5xx rate."
 }
 ```
 
@@ -143,6 +140,7 @@ Expected output shape:
 
 ```json
 {
+  "dependentServiceFailure": true,
   "commitId": "abc123",
   "changedFiles": ["src/main/resources/application.yml"],
   "hypothesis": "The pool-size change may have contributed to connection exhaustion.",
@@ -151,9 +149,9 @@ Expected output shape:
 }
 ```
 
-The MVP uses these same response concepts in `DetectionResult` and
-`RootCauseAnalysis`. Its sample commit and confidence are demonstration values,
-not findings about a real deployment.
+The model responses map to `DetectionResult` and `RootCauseAnalysis`. The host
+rejects unknown commit IDs and files; demo commit IDs and confidence are sample
+values, not findings about a real deployment.
 
 ## 5. Java project components
 
@@ -162,10 +160,11 @@ not findings about a real deployment.
 | `IncidentController` | Accepts alerts and retrieves reports over HTTP |
 | `LogController` | Adds sample log events to the in-memory adapter |
 | `IncidentOrchestrator` | Runs detection, conditionally runs identification, stores reports |
-| `DetectionSkill` | Queries recent error logs and evaluates metric threshold evidence |
-| `IdentifierSkill` | Requests recent changes and constructs a cautious hypothesis |
-| `LogQueryTool` | Boundary for a future log-store or MCP tool adapter |
-| `GitDiffTool` | Boundary for a future Git provider or MCP tool adapter |
+| `DetectionSkill` | Runs deterministic demo checks or asks the LLM to query logs and return structured health JSON |
+| `IdentifierSkill` | Returns a demo hypothesis or asks the LLM to inspect diffs and return structured analysis |
+| `StructuredLlmClient` | OpenAI function-calling loop with JSON-schema response handling |
+| `LogQueryTool` | Host-side boundary for log queries |
+| `GitDiffTool` | Host-side boundary for Git diffs |
 | `InMemoryLogQueryTool` | Local demo implementation with a 20-entry result limit |
 | `InMemoryGitDiffTool` | Local demo implementation for commit metadata and diffs |
 
@@ -209,10 +208,11 @@ endpoint, while the application process remains running.
 ## 7. Status and safety behavior
 
 - `HEALTHY`: no threshold breach and no matching error logs.
-- `ROOT_CAUSE_IDENTIFIED`: degradation was detected and a recent code change is
-  available to investigate. The wording remains a hypothesis.
-- `NEEDS_INVESTIGATION`: degradation was detected, but no recent change was
-  available from the Git tool.
+- `ROOT_CAUSE_IDENTIFIED`: the Identifier stage judged a returned recent change
+  to be a plausible cause, and its commit/files were verified against tool
+  results. This remains a hypothesis.
+- `NEEDS_INVESTIGATION`: degradation was detected, but the Identifier stage
+  found no plausible cause or no recent evidence.
 - No remediation is automatically executed.
 - Production integrations must enforce service/repository allowlists, access
   controls, query limits, secret redaction, and strict output validation.
@@ -229,15 +229,19 @@ mvn test
 The `payment-service` demo data is seeded at startup to make the full workflow
 easy to try without external services.
 
+For OpenAI mode, set `OPENAI_API_KEY` and `AIOPS_ANALYSIS_MODE=openai` in the
+terminal before starting the app. The model defaults to `gpt-4o-mini`; override
+it with `OPENAI_MODEL`. OpenAI mode sends the alert and bounded tool results to
+the configured endpoint and may incur API charges. Demo mode makes no model
+calls.
+
 ## 9. Next implementation steps
 
 1. Replace the in-memory log adapter with a real, access-controlled log query.
 2. Replace the in-memory Git adapter with a provider integration that returns
    only authorized, bounded diffs.
-3. Add a model/reasoning adapter with schema-constrained output and explicit
-   handling for invalid model responses and unavailable tools.
-4. Add Kafka or another event source for metric alerts and standardized logs.
-5. Add durable incident persistence, authentication, observability, retries,
+3. Add Kafka or another event source for metric alerts and standardized logs.
+4. Add durable incident persistence, authentication, observability, retries,
    and deployment configuration.
-6. Add approval controls and separately designed safeguards before considering
+5. Add approval controls and separately designed safeguards before considering
    any automated remediation.
