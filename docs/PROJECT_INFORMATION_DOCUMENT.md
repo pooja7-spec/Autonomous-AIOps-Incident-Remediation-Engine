@@ -11,7 +11,9 @@ The output is advisory; the system does not change code or deploy a fix.
 The current Java project is a local MVP. Kafka-backed log ingestion and MySQL
 persistence are implemented. Incident Analysis can query recent logs from
 Logging Service over HTTP through `LogQueryTool`; the in-memory log adapter
-remains selectable for tests and demo usage. Git evidence remains in-memory.
+remains selectable for tests and demo usage. Git evidence can be retrieved
+from an allowlisted local repository using a read-only Git CLI adapter; the
+in-memory Git adapter remains the default.
 The application supports deterministic `demo` mode and an optional OpenAI-backed
 `openai` mode. OpenAI mode uses host-executed function tools; it is not itself
 an MCP server and does not add a GitHub integration.
@@ -63,6 +65,30 @@ applies the requested minimum severity and existing 20-log bound. Connect and
 read timeouts default to two and three seconds. Failures are logged and surfaced
 as `502 Bad Gateway`; there is no silent fallback to in-memory logs.
 
+Git evidence uses the `GitDiffTool` boundary. The default `memory` adapter
+preserves demo behavior; `AIOPS_GIT_ADAPTER=cli` selects `GitCliDiffTool`.
+`ServiceRepositoryRegistry` maps `ServiceA` to the configured monorepo root,
+the configured Git history reference, and the allowlisted `service-a/`
+directory. Set `AIOPS_REPOSITORY_ROOT` to the repository root; the default `.`
+is relative to the application working directory. Set
+`AIOPS_GIT_HISTORY_REF` to choose the history reference; its default is `main`.
+For the current development layout, use
+`feature/autonomous-remediation-foundation`. Startup validates that the root
+is a Git repository, the configured reference exists and resolves to a commit,
+and the allowed path exists within the repository. Git must be installed and
+available on `PATH`, or selected with `GIT_EXECUTABLE`.
+
+The CLI adapter uses `ProcessBuilder` argument lists and read-only Git commands
+to retrieve commit IDs, commit times/messages, changed paths, and diffs. It
+limits results to five commits and 4,000 diff characters per change, restricts
+history/diff queries to configured pathspecs, filters sensitive filenames,
+redacts common secret formats, and applies a command timeout and output limit.
+It reads only the configured local history reference; it does not fetch, switch
+branches, write files, create branches or commits, push, or create pull
+requests. Git errors are surfaced without falling back to memory mode. If no
+eligible commits exist, the identifier stage has no Git evidence to support a
+root-cause hypothesis.
+
 The orchestrator continues to keep detection and identification as separate
 stages, and proposed fixes remain advisory.
 
@@ -96,18 +122,21 @@ lookback from Logging Service. In OpenAI mode, the model calls the host-provided
 `query_system_logs` tool, the host queries `LogQueryTool`, and
 the model returns schema-constrained health JSON. If the result is unhealthy,
 `IdentifierSkill` similarly provides `get_recent_commit_diffs`; the host queries
-`GitDiffTool` and the model returns structured analysis. The host verifies that
-the commit and files came from the tool results. A recent change remains a
-hypothesis, not a proven cause. Reports are stored in process memory and are
-lost when the service restarts.
+`GitDiffTool` and the model returns structured analysis. Memory mode returns
+demo evidence; CLI mode resolves the affected service through the configured
+registry and retrieves evidence only from its allowlisted paths. The host
+verifies that the commit and files came from the tool results. A recent change
+remains a hypothesis, not a proven cause. Reports are stored in process memory
+and are lost when the service restarts.
 
 ## 3. Tool contracts
 
 These are MCP-style contracts for possible future MCP integration. OpenAI mode
 uses equivalent OpenAI function-calling definitions over the existing Java
 interfaces. The project does not implement the MCP protocol. The HTTP
-`LogQueryTool` adapter connects to the Logging Service; Git queries still use
-the in-memory adapter.
+`LogQueryTool` adapter connects to the Logging Service. Git queries use the
+in-memory adapter by default, or the local read-only Git CLI adapter when
+configured.
 
 ### Log query tool
 
@@ -154,10 +183,20 @@ result to the model.
 }
 ```
 
-In the MVP, `GitDiffTool.getRecentCommitDiffs(serviceRepository,
-sinceTimestamp)` is implemented by `InMemoryGitDiffTool`. A production adapter
-must authorize repositories, bound the number and size of diffs, and avoid
-exposing unrelated source code or secrets.
+`GitDiffTool.getRecentCommitDiffs(serviceRepository, sinceTimestamp)` is
+implemented by `InMemoryGitDiffTool` in memory mode and `GitCliDiffTool` in CLI
+mode. CLI mode first resolves the service through `ServiceRepositoryRegistry`;
+the request's service name is never treated as a path or repository URL.
+`ServiceA` maps to `AIOPS_REPOSITORY_ROOT` and `service-a/`, with
+`aiops.git.history-ref` selecting the commit history (default `main`,
+overridden by `AIOPS_GIT_HISTORY_REF`). Short branch names resolve as local
+branches; full Git references such as `refs/tags/<tag>` are also supported.
+The registry rejects unknown services, invalid roots, missing or invalid
+references, and allowlisted paths outside the repository. The CLI adapter runs
+only local, read-only commands against the configured ref and allowed pathspecs.
+Results are bounded to five commits, 4,000 diff characters per change, and
+limited command output/time. Sensitive filenames are excluded and common
+credential formats are redacted. No changes are made to the repository.
 OpenAI mode limits each response to five changes, 50 paths and 4,000 diff
 characters per change; commit messages are capped at 500 characters.
 
@@ -225,6 +264,8 @@ values, not findings about a real deployment.
 | `InMemoryLogQueryTool` | Local demo implementation with a 20-entry result limit |
 | `LoggingServiceLogQueryTool` | HTTP implementation for querying Logging Service recent logs |
 | `InMemoryGitDiffTool` | Local demo implementation for commit metadata and diffs |
+| `ServiceRepositoryRegistry` | Configuration-driven service-to-repository and allowed-path mapping |
+| `GitCliDiffTool` | Read-only local Git history/diff adapter with bounded, sanitized output |
 
 ## 6. API summary
 
@@ -297,8 +338,8 @@ calls.
 
 1. Add authentication/access control and operational monitoring for the
    Logging Service HTTP adapter.
-2. Replace the in-memory Git adapter with a provider integration that returns
-   only authorized, bounded diffs.
+2. Harden the read-only Git and Logging Service adapters with deployment
+   authentication, access control, and operational monitoring.
 3. Add Kafka ingestion for metric alerts and harden the incident workflow for
    production operation.
 4. Add durable incident persistence, authentication, observability, retries,

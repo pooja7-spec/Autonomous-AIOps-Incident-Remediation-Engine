@@ -71,8 +71,50 @@ Service A/B log ingestion uses Kafka and Logging Service stores consumed events
 in MySQL. The incident-analysis workflow can query recent logs from Logging
 Service through its existing `LogQueryTool` boundary when the HTTP adapter is
 selected; the in-memory adapter remains the default for tests and demo usage.
-Git evidence remains in-memory, and the project is not connected to GitHub or
-an MCP server. OpenAI analysis is optional and enabled only when configured.
+Git evidence can be retrieved from the local monorepo using the read-only Git
+CLI adapter; the in-memory adapter remains the default for tests and demo
+usage. This does not connect to GitHub or an MCP server. OpenAI analysis is
+optional and enabled only when configured.
+
+### Read-only Git evidence
+
+The Git adapter is selected with `AIOPS_GIT_ADAPTER`. Its default is `memory`;
+set it to `cli` to read actual commit metadata and diffs. The configured
+registry maps `ServiceA` to the monorepo root and limits queries to
+`service-a/`. The repository root is supplied using
+`AIOPS_REPOSITORY_ROOT`; the history reference is configured with
+`AIOPS_GIT_HISTORY_REF` (default `main`). For this development branch, set it
+to `feature/autonomous-remediation-foundation`. The configured reference must
+exist in the local repository and the allowed service directory must exist.
+Git must be installed and available on `PATH` (or selected with
+`GIT_EXECUTABLE`).
+
+Run these commands from the repository root in PowerShell:
+
+```powershell
+$env:AIOPS_GIT_ADAPTER = "cli"
+$env:AIOPS_REPOSITORY_ROOT = (Get-Location).Path
+$env:AIOPS_GIT_HISTORY_REF = "feature/autonomous-remediation-foundation"
+$env:AIOPS_LOGGING_ADAPTER = "http"
+$env:LOGGING_SERVICE_BASE_URL = "http://localhost:8083"
+mvn -pl incident-analysis-service -am spring-boot:run
+```
+
+In another terminal, trigger an incident. The affected service must be
+`ServiceA` to use its configured Git mapping:
+
+```powershell
+curl.exe -X POST http://localhost:8084/api/incidents/trigger `
+  -H "Content-Type: application/json" `
+  -d "{\"service\":\"ServiceA\",\"metricName\":\"http_5xx_rate\",\"observedValue\":7.5,\"threshold\":5.0}"
+```
+
+Git mode only reads the configured local history reference and the allowlisted
+`service-a/` path. `aiops.git.history-ref` defaults to `main` and can be
+overridden with `AIOPS_GIT_HISTORY_REF`. An invalid or missing reference
+prevents CLI mode from starting; there is no fallback to `main` or in-memory
+Git data. Git mode does not fetch, switch branches, modify files, create
+branches or commits, push, or create pull requests.
 
 The proposed recovery action is advisory; the application does not modify code
 or deploy changes automatically.
@@ -143,6 +185,58 @@ curl.exe -X POST http://localhost:8081/api/logs `
 The endpoint responds with `202 Accepted` after Kafka acknowledges the event.
 After Logging Service consumes it, retrieve it with
 `curl.exe http://localhost:8083/api/logs/evt-001`.
+
+### Service A database operation demo
+
+Service A writes demo requests to its own `service_a_demo_records` table in the
+existing MySQL database. The idempotent `schema.sql` initialization creates
+the table if missing; it does not modify Logging Service's `log_events` table.
+Configure the connection with `MYSQL_HOST` (default `localhost`),
+`MYSQL_PORT` (default `3306`), `MYSQL_DATABASE` (default `aiops`), and
+`MYSQL_USER` (default `aiops`). Set `MYSQL_PASSWORD` in the environment. An
+optional `MYSQL_URL` overrides the assembled JDBC URL.
+
+Start Service A from the repository root in PowerShell, using credentials
+already configured for your MySQL container:
+
+```powershell
+$env:MYSQL_HOST = "localhost"
+$env:MYSQL_PORT = "3306"
+$env:MYSQL_DATABASE = "aiops"
+$env:MYSQL_USER = "<configured MySQL user>"
+$env:MYSQL_PASSWORD = "<configured MySQL password>"
+mvn -pl service-a -am spring-boot:run
+```
+
+Submit an insert to `POST /api/demo/database-operation`:
+
+```powershell
+$body = @{ recordId = "record-001"; payload = "sample database operation" } |
+  ConvertTo-Json -Compress
+curl.exe -i -X POST http://localhost:8081/api/demo/database-operation `
+  -H "Content-Type: application/json" -d $body
+```
+
+A successful insert returns `201 Created` with the record ID and UTC creation
+time. Request fields are validated (`recordId` is required and at most 100
+characters; `payload` is required and at most 10,000 characters). To generate
+a real database error without changing schema or stopping MySQL, repeat the
+same request: the duplicate primary key returns `503 Service Unavailable` and
+Service A publishes a sanitized `ERROR` event to the existing `log-events`
+Kafka topic. If Kafka publishing also fails, that failure is logged and the
+endpoint still returns the database `503`.
+
+With Logging Service running against the same Kafka broker and MySQL instance,
+verify the generated event after the failed request:
+
+```powershell
+curl.exe "http://localhost:8083/api/logs/recent?service=ServiceA&minutes=5"
+```
+
+The event uses severity `ERROR`, service `ServiceA`, a generated event ID, a
+UTC timestamp, and the fixed message `Database operation failed`; it does not
+include credentials or exception details. Integration tests use an isolated
+H2 database and embedded Kafka.
 
 To run Incident Analysis using logs from the existing Logging Service, set the
 adapter selection before starting the service:
@@ -222,7 +316,9 @@ put API keys in source code or commit them.
 3. When `AIOPS_LOGGING_ADAPTER=http`, Incident Analysis calls Logging Service's
    recent-log endpoint through `LogQueryTool`; in-memory mode remains the
    default for tests and demos. Detection runs before identification, and
-   `GitDiffTool` remains the boundary for code-change evidence.
+   `GitDiffTool` remains the boundary for code-change evidence. Set
+   `AIOPS_GIT_ADAPTER=cli` and `AIOPS_REPOSITORY_ROOT` to use real, read-only
+   local Git history, restricted to configured service paths.
 
 Logging Service failures in HTTP mode are reported as gateway errors; the
 application does not silently substitute demo logs.
