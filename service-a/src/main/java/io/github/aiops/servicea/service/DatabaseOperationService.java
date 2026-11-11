@@ -19,7 +19,7 @@ public class DatabaseOperationService {
 
     private static final Logger logger = LoggerFactory.getLogger(DatabaseOperationService.class);
     private static final String INSERT_SQL = """
-            INSERT INTO service_a_demo_records (record_id, payload, created_at)
+            INSERT INTO service_a_demo_records (record_id, paylod, created_at)
             VALUES (?, ?, ?)
             """;
 
