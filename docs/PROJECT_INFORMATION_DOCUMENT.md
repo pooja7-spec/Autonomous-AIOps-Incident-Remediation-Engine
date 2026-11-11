@@ -8,11 +8,63 @@ relevant log and source-control evidence through tool boundaries, detects
 degradation, and returns a root-cause hypothesis with a proposed recovery action.
 The output is advisory; the system does not change code or deploy a fix.
 
-The current Java project is a local MVP. Its in-memory log and Git adapters are
-demo implementations, not live Kafka, Elasticsearch, or GitHub integrations.
-It supports deterministic `demo` mode and an optional OpenAI-backed `openai`
-mode. OpenAI mode uses host-executed function tools; it is not itself an MCP
-server and does not add live log-store or GitHub integrations.
+The current Java project is a local MVP. Kafka-backed log ingestion and MySQL
+persistence are implemented. Incident Analysis can query recent logs from
+Logging Service over HTTP through `LogQueryTool`; the in-memory log adapter
+remains selectable for tests and demo usage. Git evidence remains in-memory.
+The application supports deterministic `demo` mode and an optional OpenAI-backed
+`openai` mode. OpenAI mode uses host-executed function tools; it is not itself
+an MCP server and does not add a GitHub integration.
+
+## 1.1 Maven monorepo structure and implementation status
+
+The repository is a Java 17 Maven reactor with five modules:
+
+| Module | Responsibility | Default port |
+| --- | --- | ---: |
+| `service-a` | Service A API and Kafka `LogEvent` producer | 8081 |
+| `service-b` | Service B API and Kafka `LogEvent` producer | 8082 |
+| `logging-service` | Kafka `LogEvent` consumer, MySQL persistence, and event lookup API | 8083 |
+| `incident-analysis-service` | Existing incident API, orchestrator, Detection/Identifier skills, adapters, and optional OpenAI client | 8084 |
+| `common-contracts` | Shared `LogEvent`, `IncidentAnalysisEvent`, and `Severity` types | n/a |
+
+`common-contracts` is a plain Java library. The other four modules are
+independently runnable Spring Boot applications with their own configuration.
+All three ingestion services expose `GET /api/info`; Service A and Service B
+also accept `POST /api/logs`, while Logging Service exposes
+`GET /api/logs/{eventId}`, `GET /api/logs/search`, and
+`GET /api/logs/recent`.
+
+Service A/B publish shared `LogEvent` JSON messages to the configurable Kafka
+topic (default `log-events`). Logging Service consumes that topic and persists
+events through Spring Data JPA to the existing MySQL `aiops` database. Kafka
+bootstrap servers and the MySQL URL are configurable; MySQL username and
+password are read from `MYSQL_USER` and `MYSQL_PASSWORD`. The local Docker
+Compose configuration supplies the Kafka KRaft broker and MySQL 8.4 services.
+
+`GET /api/logs/search` supports optional `service`, `severity`, ISO-8601 UTC
+`startTime`/`endTime`, and `page`/`size` parameters (defaults: `0`/`20`, maximum
+size: 100). It returns `content`, `pageNumber`, `pageSize`, `totalElements`,
+and `totalPages`, ordered by descending event timestamp. `GET /api/logs/recent`
+accepts optional `service` and `minutes` (default 5, maximum 60), and returns
+events between the current UTC time and `now - minutes`, newest first. Invalid
+timestamps and out-of-range query values return HTTP 400 with a structured
+error message. Both queries run in the database; the search endpoint uses
+Spring Data pagination. The existing event-by-ID endpoint remains available.
+
+Detection Skill queries through `LogQueryTool`. The default `memory` adapter
+preserves in-memory demo/test behavior; setting `AIOPS_LOGGING_ADAPTER=http`
+selects an HTTP adapter that calls
+`/api/logs/recent?service=<affected-service>&minutes=<lookback>` on Logging
+Service. Configure its base URL with `logging.service.base-url` (default
+`http://localhost:8083`), or `LOGGING_SERVICE_BASE_URL`. The HTTP adapter maps
+shared `LogEvent` records into the existing internal `LogEntry` model, then
+applies the requested minimum severity and existing 20-log bound. Connect and
+read timeouts default to two and three seconds. Failures are logged and surfaced
+as `502 Bad Gateway`; there is no silent fallback to in-memory logs.
+
+The orchestrator continues to keep detection and identification as separate
+stages, and proposed fixes remain advisory.
 
 ## 2. Core system design and workflow
 
@@ -37,9 +89,11 @@ server and does not add live log-store or GitHub integrations.
 ### Current MVP flow
 
 The Java application accepts a metric alert at `POST /api/incidents/trigger`.
-`IncidentOrchestrator` invokes `DetectionSkill`. In demo mode, it deterministically
-queries up to 20 `ERROR` or `CRITICAL` entries. In OpenAI mode, the model calls
-the host-provided `query_system_logs` tool, the host queries `LogQueryTool`, and
+`IncidentOrchestrator` invokes `DetectionSkill`, which queries up to 20 recent
+`ERROR` or `CRITICAL` logs through `LogQueryTool`. The default memory adapter
+uses demo entries; HTTP mode retrieves the affected service's configured
+lookback from Logging Service. In OpenAI mode, the model calls the host-provided
+`query_system_logs` tool, the host queries `LogQueryTool`, and
 the model returns schema-constrained health JSON. If the result is unhealthy,
 `IdentifierSkill` similarly provides `get_recent_commit_diffs`; the host queries
 `GitDiffTool` and the model returns structured analysis. The host verifies that
@@ -51,8 +105,9 @@ lost when the service restarts.
 
 These are MCP-style contracts for possible future MCP integration. OpenAI mode
 uses equivalent OpenAI function-calling definitions over the existing Java
-interfaces. The project does not implement the MCP protocol or connect to a real
-log or Git service.
+interfaces. The project does not implement the MCP protocol. The HTTP
+`LogQueryTool` adapter connects to the Logging Service; Git queries still use
+the in-memory adapter.
 
 ### Log query tool
 
@@ -73,11 +128,13 @@ log or Git service.
 }
 ```
 
-In the MVP, `LogQueryTool.queryLogs(service, lookbackMinutes, minimumSeverity)`
-is implemented by `InMemoryLogQueryTool`. It filters by service, time, and
-severity, sorts newest first, and returns at most 20 entries. In OpenAI mode,
-the host further truncates each message to 2,000 characters before returning
-the query result to the model.
+`LogQueryTool.queryLogs(service, lookbackMinutes, minimumSeverity)` is
+implemented by `InMemoryLogQueryTool` in memory mode and
+`LoggingServiceLogQueryTool` in HTTP mode. The HTTP adapter calls the Logging
+Service recent endpoint, maps results to `LogEntry`, filters minimum severity,
+sorts newest first, and returns at most 20 entries. In OpenAI mode, the host
+further truncates each message to 2,000 characters before returning the query
+result to the model.
 
 ### Recent Git diff tool
 
@@ -166,6 +223,7 @@ values, not findings about a real deployment.
 | `LogQueryTool` | Host-side boundary for log queries |
 | `GitDiffTool` | Host-side boundary for Git diffs |
 | `InMemoryLogQueryTool` | Local demo implementation with a 20-entry result limit |
+| `LoggingServiceLogQueryTool` | HTTP implementation for querying Logging Service recent logs |
 | `InMemoryGitDiffTool` | Local demo implementation for commit metadata and diffs |
 
 ## 6. API summary
@@ -237,10 +295,12 @@ calls.
 
 ## 9. Next implementation steps
 
-1. Replace the in-memory log adapter with a real, access-controlled log query.
+1. Add authentication/access control and operational monitoring for the
+   Logging Service HTTP adapter.
 2. Replace the in-memory Git adapter with a provider integration that returns
    only authorized, bounded diffs.
-3. Add Kafka or another event source for metric alerts and standardized logs.
+3. Add Kafka ingestion for metric alerts and harden the incident workflow for
+   production operation.
 4. Add durable incident persistence, authentication, observability, retries,
    and deployment configuration.
 5. Add approval controls and separately designed safeguards before considering
