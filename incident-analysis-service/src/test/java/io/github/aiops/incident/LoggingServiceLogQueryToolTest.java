@@ -134,7 +134,8 @@ class LoggingServiceLogQueryToolTest {
                 },
                 new ObjectMapper().findAndRegisterModules(),
                 5,
-                "demo");
+                "demo",
+                "groq");
         MetricAlert alert = new MetricAlert(
                 "ServiceA",
                 "http_5xx_rate",

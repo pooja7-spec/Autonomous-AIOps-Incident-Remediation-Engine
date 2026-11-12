@@ -1,6 +1,8 @@
 package io.github.aiops.incident.tools;
 
 import io.github.aiops.incident.config.GitIntegrationProperties;
+import io.github.aiops.incident.llm.ToolFailureReason;
+import io.github.aiops.incident.llm.ToolValidationException;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -42,7 +44,7 @@ public class ServiceRepositoryRegistry {
     public RepositoryTarget resolve(String serviceName) {
         RepositoryTarget target = targets.get(serviceName);
         if (target == null) {
-            throw new IllegalArgumentException("No Git repository is configured for service '" + serviceName + "'.");
+            throw new ToolValidationException(ToolFailureReason.REPOSITORY_MAPPING_MISSING);
         }
         return target;
     }

@@ -4,6 +4,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.aiops.incident.config.GitIntegrationProperties;
 import io.github.aiops.incident.domain.DetectionResult;
 import io.github.aiops.incident.domain.MetricAlert;
+import io.github.aiops.incident.llm.ToolFailureReason;
+import io.github.aiops.incident.llm.ToolValidationException;
 import io.github.aiops.incident.tools.GitCliDiffTool;
 import io.github.aiops.incident.tools.GitCommandException;
 import io.github.aiops.incident.tools.GitCommandRunner;
@@ -20,6 +22,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -54,7 +57,11 @@ class GitCliDiffToolTest {
         ServiceRepositoryRegistry registry =
                 new ServiceRepositoryRegistry(properties(createRepository(), List.of("service-a")));
 
-        assertThrows(IllegalArgumentException.class, () -> registry.resolve("ServiceB"));
+        ToolValidationException exception = assertThrows(
+                ToolValidationException.class,
+                () -> registry.resolve("ServiceB")
+        );
+        assertEquals(ToolFailureReason.REPOSITORY_MAPPING_MISSING, exception.getReason());
     }
 
     @Test
@@ -111,6 +118,44 @@ class GitCliDiffToolTest {
     }
 
     @Test
+    void boundedGitQueryIncludesSixteenHourCommitAndExcludesOutOfWindowCommits() throws Exception {
+        Path repository = createRepository();
+        Instant incidentTime = Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS);
+        commitAt(
+                repository,
+                "service-a/src/App.java",
+                "class App { int value = 0; }\n",
+                "Commit older than window",
+                incidentTime.minus(Duration.ofHours(25))
+        );
+        commitAt(
+                repository,
+                "service-a/src/App.java",
+                "class App { int value = 16; }\n",
+                "Commit sixteen hours before incident",
+                incidentTime.minus(Duration.ofHours(16))
+        );
+        commitAt(
+                repository,
+                "service-a/src/App.java",
+                "class App { int value = 25; }\n",
+                "Commit after incident",
+                incidentTime.plus(Duration.ofHours(1))
+        );
+
+        var changes = gitTool(repository, List.of("service-a"))
+                .getRecentCommitDiffs(
+                        "ServiceA",
+                        incidentTime.minus(Duration.ofHours(24)),
+                        incidentTime
+                );
+
+        assertEquals(1, changes.size());
+        assertEquals("Commit sixteen hours before incident", changes.get(0).commitMessage());
+        assertTrue(changes.get(0).committedAt().isBefore(incidentTime));
+    }
+
+    @Test
     void configuredFeatureReferenceProvidesCommitsWithinTheServicePath() throws Exception {
         Path repository = createRepository();
         commit(repository, "README.md", "main history\n", "Main branch documentation");
@@ -124,7 +169,7 @@ class GitCliDiffToolTest {
         properties.setHistoryRef(featureBranch);
         ServiceRepositoryRegistry registry = new ServiceRepositoryRegistry(properties);
         var changes = new GitCliDiffTool(registry, new GitCommandRunner("git", Duration.ofSeconds(5)))
-                .getRecentCommitDiffs("ServiceA", Instant.EPOCH);
+                .getRecentCommitDiffs("ServiceA", Instant.EPOCH, Instant.now().plusSeconds(10));
 
         assertEquals("refs/heads/" + featureBranch, registry.resolve("ServiceA").historyRef());
         assertEquals(1, changes.size());
@@ -179,7 +224,7 @@ class GitCliDiffToolTest {
         Path repository = createRepository();
         commit(repository, "service-a/src/App.java", "class App { int value = 1; }\n", "Recent Service A change");
         GitCliDiffTool tool = gitTool(repository, List.of("service-a"));
-        IdentifierSkill skill = new IdentifierSkill(tool, null, new ObjectMapper(), "demo");
+        IdentifierSkill skill = new IdentifierSkill(tool, null, new ObjectMapper(), 24, "demo", "groq");
         Instant alertTime = Instant.now().plusSeconds(1);
         MetricAlert alert = new MetricAlert(
                 "ServiceA",
@@ -229,14 +274,45 @@ class GitCliDiffToolTest {
         runGit(repository, "commit", "-m", message);
     }
 
+    private void commitAt(
+            Path repository,
+            String relativePath,
+            String content,
+            String message,
+            Instant committedAt
+    ) throws IOException {
+        Path file = repository.resolve(relativePath);
+        Files.createDirectories(file.getParent());
+        Files.writeString(file, content, StandardCharsets.UTF_8);
+        runGit(repository, "add", "--", relativePath);
+        String gitDate = "@" + committedAt.getEpochSecond();
+        runGitOutput(
+                repository,
+                Map.of("GIT_AUTHOR_DATE", gitDate, "GIT_COMMITTER_DATE", gitDate),
+                "commit",
+                "-m",
+                message
+        );
+    }
+
     private void runGit(Path repository, String... arguments) throws IOException {
         runGitOutput(repository, arguments);
     }
 
     private String runGitOutput(Path repository, String... arguments) throws IOException {
+        return runGitOutput(repository, Map.of(), arguments);
+    }
+
+    private String runGitOutput(
+            Path repository,
+            Map<String, String> environment,
+            String... arguments
+    ) throws IOException {
         List<String> command = new java.util.ArrayList<>(List.of("git", "-C", repository.toString()));
         command.addAll(List.of(arguments));
-        Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
+        ProcessBuilder processBuilder = new ProcessBuilder(command).redirectErrorStream(true);
+        processBuilder.environment().putAll(environment);
+        Process process = processBuilder.start();
         try {
             if (!process.waitFor(10, java.util.concurrent.TimeUnit.SECONDS)) {
                 process.destroyForcibly();

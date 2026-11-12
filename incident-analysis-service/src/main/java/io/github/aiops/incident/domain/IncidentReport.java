@@ -8,6 +8,7 @@ public record IncidentReport(
         IncidentStatus status,
         DetectionResult detection,
         RootCauseAnalysis rootCauseAnalysis,
+        PatchProposal patchProposal,
         Instant createdAt
 ) {
 }

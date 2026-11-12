@@ -10,6 +10,8 @@ import io.github.aiops.incident.domain.MetricAlert;
 import io.github.aiops.incident.llm.FunctionTool;
 import io.github.aiops.incident.llm.LlmIntegrationException;
 import io.github.aiops.incident.llm.StructuredLlmClient;
+import io.github.aiops.incident.llm.ToolFailureReason;
+import io.github.aiops.incident.llm.ToolValidationException;
 import io.github.aiops.incident.tools.LogQueryTool;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
@@ -31,13 +33,15 @@ public class DetectionSkill {
     private final ObjectMapper objectMapper;
     private final int lookbackMinutes;
     private final String analysisMode;
+    private final String provider;
 
     public DetectionSkill(
             LogQueryTool logQueryTool,
             StructuredLlmClient llmClient,
             ObjectMapper objectMapper,
             @Value("${aiops.detection.lookback-minutes:5}") int lookbackMinutes,
-            @Value("${aiops.analysis.mode:demo}") String analysisMode
+            @Value("${aiops.analysis.mode:demo}") String analysisMode,
+            @Value("${aiops.llm.provider:groq}") String provider
     ) {
         if (lookbackMinutes < 1 || lookbackMinutes > 60) {
             throw new IllegalStateException("aiops.detection.lookback-minutes must be between 1 and 60.");
@@ -47,10 +51,11 @@ public class DetectionSkill {
         this.objectMapper = objectMapper;
         this.lookbackMinutes = lookbackMinutes;
         this.analysisMode = analysisMode;
+        this.provider = provider;
     }
 
     public DetectionResult analyze(MetricAlert alert) {
-        if ("openai".equalsIgnoreCase(analysisMode)) {
+        if ("llm".equalsIgnoreCase(analysisMode) || "openai".equalsIgnoreCase(analysisMode)) {
             return analyzeWithLlm(alert);
         }
         if (!"demo".equalsIgnoreCase(analysisMode)) {
@@ -71,19 +76,20 @@ public class DetectionSkill {
         Set<LogEntry> queriedLogs = new LinkedHashSet<>();
         FunctionTool queryLogs = new FunctionTool(
                 "query_system_logs",
-                "Query recent logs for the affected service. Use the supplied service and a bounded lookback.",
+                "Query logs for the service associated with the current incident. Always set lookback_minutes "
+                        + "to an integer from 1 to " + lookbackMinutes
+                        + ", inclusive. Use a reasonable short window for investigation, such as 5 minutes "
+                        + "when it is within that range. Do not invent values outside these limits.",
                 logQuerySchema(),
                 arguments -> {
                     requireObject(arguments);
                     String service = requiredText(arguments, "service");
                     if (!alert.service().equals(service)) {
-                        throw new IllegalArgumentException("Only the alerted service may be queried.");
+                        throw new ToolValidationException(ToolFailureReason.SERVICE_MISMATCH);
                     }
                     int requestedLookback = requiredInteger(arguments, "lookback_minutes");
                     if (requestedLookback < 1 || requestedLookback > lookbackMinutes) {
-                        throw new IllegalArgumentException(
-                                "lookback_minutes must be between 1 and " + lookbackMinutes + "."
-                        );
+                        throw new ToolValidationException(ToolFailureReason.LOOKBACK_OUT_OF_RANGE);
                     }
                     Severity minimumSeverity = parseSeverity(requiredText(arguments, "min_severity"));
                     List<LogEntry> result = logQueryTool.queryLogs(
@@ -116,11 +122,32 @@ public class DetectionSkill {
         if (!hasOnlyFields(output, Set.of("isHealthy", "summary"))
                 || !output.path("isHealthy").isBoolean()
                 || !output.path("summary").isTextual()) {
-            throw new LlmIntegrationException("The detection response does not match the required contract.");
+            throw new LlmIntegrationException(
+                    "The detection response does not match the required contract.",
+                    provider,
+                    "DetectionSkill validation",
+                    "response_validation"
+            );
         }
-        DetectionOutput result = objectMapper.convertValue(output, DetectionOutput.class);
+        DetectionOutput result;
+        try {
+            result = objectMapper.convertValue(output, DetectionOutput.class);
+        } catch (IllegalArgumentException exception) {
+            throw new LlmIntegrationException(
+                    "The detection response could not be processed.",
+                    exception,
+                    provider,
+                    "DetectionSkill validation",
+                    "response_validation"
+            );
+        }
         if (result.summary() == null || result.summary().isBlank()) {
-            throw new LlmIntegrationException("The detection response must include a non-empty summary.");
+            throw new LlmIntegrationException(
+                    "The detection response must include a non-empty summary.",
+                    provider,
+                    "DetectionSkill validation",
+                    "response_validation"
+            );
         }
         boolean isHealthy = result.isHealthy() && !alert.thresholdBreached();
         String summary = alert.thresholdBreached() && result.isHealthy()
@@ -135,7 +162,11 @@ public class DetectionSkill {
         schema.put("additionalProperties", false);
         ObjectNode properties = schema.putObject("properties");
         properties.putObject("service").put("type", "string");
-        properties.putObject("lookback_minutes").put("type", "integer");
+        ObjectNode lookback = properties.putObject("lookback_minutes");
+        lookback.put("type", "integer");
+        lookback.put("description", "Number of minutes of logs to retrieve.");
+        lookback.put("minimum", 1);
+        lookback.put("maximum", lookbackMinutes);
         ObjectNode severity = properties.putObject("min_severity");
         severity.put("type", "string");
         severity.putArray("enum").add("ERROR").add("CRITICAL");
@@ -156,14 +187,14 @@ public class DetectionSkill {
 
     private void requireObject(JsonNode value) {
         if (value == null || !value.isObject()) {
-            throw new IllegalArgumentException("Tool arguments must be a JSON object.");
+            throw new ToolValidationException(ToolFailureReason.INVALID_SERVICE_ARGUMENT);
         }
     }
 
     private String requiredText(JsonNode value, String field) {
         JsonNode fieldValue = value.get(field);
         if (fieldValue == null || !fieldValue.isTextual() || fieldValue.asText().isBlank()) {
-            throw new IllegalArgumentException(field + " must be a non-empty string.");
+            throw new ToolValidationException(ToolFailureReason.INVALID_SERVICE_ARGUMENT);
         }
         return fieldValue.asText();
     }
@@ -171,7 +202,7 @@ public class DetectionSkill {
     private int requiredInteger(JsonNode value, String field) {
         JsonNode fieldValue = value.get(field);
         if (fieldValue == null || !fieldValue.isIntegralNumber() || !fieldValue.canConvertToInt()) {
-            throw new IllegalArgumentException(field + " must be an integer.");
+            throw new ToolValidationException(ToolFailureReason.LOOKBACK_OUT_OF_RANGE);
         }
         return fieldValue.intValue();
     }
@@ -180,7 +211,7 @@ public class DetectionSkill {
         try {
             return Severity.valueOf(value);
         } catch (IllegalArgumentException exception) {
-            throw new IllegalArgumentException("min_severity must be ERROR or CRITICAL.", exception);
+            throw new ToolValidationException(ToolFailureReason.INVALID_SEVERITY, exception);
         }
     }
 

@@ -1,7 +1,7 @@
 # Autonomous AI-Powered Incident Remediation Engine
 
 A Java 17 and Spring Boot Maven multi-module monorepo for an incident analysis
-workflow. The existing incident detection, identification, and optional OpenAI
+workflow. The existing incident detection, identification, and optional Groq-compatible LLM
 tool-calling workflow is preserved in `incident-analysis-service`.
 
 ## Modules
@@ -11,7 +11,7 @@ tool-calling workflow is preserved in `incident-analysis-service`.
 | `service-a` | Service A API and Kafka log-event producer | 8081 |
 | `service-b` | Service B API and Kafka log-event producer | 8082 |
 | `logging-service` | Kafka log-event consumer, MySQL persistence, and log lookup API | 8083 |
-| `incident-analysis-service` | Incident API, orchestrator, detection/identifier skills, demo adapters, optional OpenAI analysis | 8084 |
+| `incident-analysis-service` | Incident API, orchestrator, detection/identifier skills, demo adapters, optional Groq LLM analysis | 8084 |
 | `common-contracts` | Shared event models such as `LogEvent`, `IncidentAnalysisEvent`, and `Severity` | n/a |
 
 All three services expose `GET /api/info`. Service A and Service B accept
@@ -73,7 +73,7 @@ Service through its existing `LogQueryTool` boundary when the HTTP adapter is
 selected; the in-memory adapter remains the default for tests and demo usage.
 Git evidence can be retrieved from the local monorepo using the read-only Git
 CLI adapter; the in-memory adapter remains the default for tests and demo
-usage. This does not connect to GitHub or an MCP server. OpenAI analysis is
+usage. This does not connect to GitHub or an MCP server. LLM analysis is
 optional and enabled only when configured.
 
 ### Read-only Git evidence
@@ -118,6 +118,30 @@ branches or commits, push, or create pull requests.
 
 The proposed recovery action is advisory; the application does not modify code
 or deploy changes automatically.
+
+### AI patch proposals
+
+When `AIOPS_ANALYSIS_MODE=llm` and root-cause identification succeeds, the
+incident workflow asks the configured LLM provider for a minimal unified-diff
+proposal. Patch context is retrieved through the existing read-only
+`GitDiffTool` boundary, using the incident service mapping and allowed paths.
+For repository-backed context, configure `AIOPS_GIT_ADAPTER=cli`,
+`AIOPS_REPOSITORY_ROOT`, and the appropriate `AIOPS_GIT_HISTORY_REF`.
+The memory adapter is not considered repository-backed and causes patch
+generation to be rejected without an LLM request.
+
+The incident response includes `patchProposal` with `incidentId`,
+`sourceCommitId`, `summary`, `targetFiles`, `unifiedDiff`, `validationStatus`,
+and `rejectionReason`. `PROPOSED_FOR_REVIEW` means Java accepted the diff's
+structure and checked its commit and file paths against the returned Git
+evidence. It does not mean the patch was applied, built, tested, or proven
+correct. Invalid proposals are returned with `validationStatus: "REJECTED"`
+and a safe reason code. Demo mode returns a rejection without making an LLM
+request.
+
+The patch generator has no shell, Git-command, or filesystem tools. It never
+applies patches, writes source files, creates branches, commits, pull requests,
+or deploys changes. Developers must review and independently test any proposal.
 
 ## Requirements and build
 
@@ -291,22 +315,34 @@ The producer and consumer integration tests use embedded Kafka and an
 in-memory H2 database, so `mvn test` does not require the running Docker
 services. Runtime ingestion uses the existing Compose services.
 
-## Optional OpenAI analysis
+## Optional Groq LLM analysis
 
-The default `demo` mode uses deterministic rules and does not call an LLM. To
-enable OpenAI mode, set the API key in the same PowerShell terminal used to
-start the service:
+The default `demo` mode uses deterministic rules and does not call an LLM. Set
+`AIOPS_ANALYSIS_MODE=llm` to use the configured provider (default: Groq).
+`openai` remains an accepted legacy mode value. Enter the Groq API key without
+echoing it into the terminal:
 
 ```powershell
-$env:OPENAI_API_KEY = "YOUR_OPENAI_API_KEY"
-$env:AIOPS_ANALYSIS_MODE = "openai"
+$env:GROQ_API_KEY = [System.Net.NetworkCredential]::new(
+    "",
+    (Read-Host "Groq API key" -AsSecureString)
+).Password
+$env:AIOPS_ANALYSIS_MODE = "llm"
+$env:AIOPS_LLM_PROVIDER = "groq"
+$env:AIOPS_GIT_ADAPTER = "cli"
+$env:AIOPS_REPOSITORY_ROOT = (Get-Location).Path
+$env:AIOPS_GIT_HISTORY_REF = "feature/autonomous-remediation-foundation"
+$env:AIOPS_LOGGING_ADAPTER = "http"
+$env:LOGGING_SERVICE_BASE_URL = "http://localhost:8083"
 mvn -pl incident-analysis-service -am spring-boot:run
 ```
 
-The model defaults to `gpt-4o-mini`; override it with `OPENAI_MODEL`. API use is
-billed separately from a ChatGPT subscription. In OpenAI mode, the incident
-alert and bounded log/diff evidence are sent to the configured endpoint. Do not
-put API keys in source code or commit them.
+The default Groq endpoint is `https://api.groq.com/openai/v1` and model is
+`openai/gpt-oss-120b`. Override these with `GROQ_BASE_URL` and `GROQ_MODEL`.
+Provider-neutral overrides are `AIOPS_LLM_API_KEY`, `AIOPS_LLM_BASE_URL`, and
+`AIOPS_LLM_MODEL`. The provider uses the OpenAI-compatible chat-completions
+protocol; incident alerts and bounded log/diff evidence are sent to that
+provider. Keep API keys in environment variables and never commit them.
 
 ## Communication flow
 

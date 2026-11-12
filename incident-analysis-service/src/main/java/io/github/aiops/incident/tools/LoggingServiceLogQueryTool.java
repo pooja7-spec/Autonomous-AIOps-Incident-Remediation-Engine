@@ -3,6 +3,8 @@ package io.github.aiops.incident.tools;
 import io.github.aiops.contracts.event.LogEvent;
 import io.github.aiops.contracts.event.Severity;
 import io.github.aiops.incident.domain.LogEntry;
+import io.github.aiops.incident.llm.ToolFailureReason;
+import io.github.aiops.incident.llm.ToolValidationException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.core.ParameterizedTypeReference;
@@ -29,14 +31,17 @@ public class LoggingServiceLogQueryTool implements LogQueryTool {
 
     @Override
     public List<LogEntry> queryLogs(String service, int lookbackMinutes, Severity minimumSeverity) {
+        if (restClient == null) {
+            throw new ToolValidationException(ToolFailureReason.LOGGING_CONFIGURATION_MISSING);
+        }
         if (service == null || service.isBlank()) {
-            throw new IllegalArgumentException("service must not be blank");
+            throw new ToolValidationException(ToolFailureReason.INVALID_SERVICE_ARGUMENT);
         }
         if (lookbackMinutes < 1 || lookbackMinutes > 60) {
-            throw new IllegalArgumentException("lookbackMinutes must be between 1 and 60");
+            throw new ToolValidationException(ToolFailureReason.LOOKBACK_OUT_OF_RANGE);
         }
         if (minimumSeverity == null) {
-            throw new IllegalArgumentException("minimumSeverity must not be null");
+            throw new ToolValidationException(ToolFailureReason.INVALID_SEVERITY);
         }
 
         List<LogEvent> events;

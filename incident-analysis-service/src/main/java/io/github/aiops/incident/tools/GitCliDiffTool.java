@@ -1,6 +1,8 @@
 package io.github.aiops.incident.tools;
 
 import io.github.aiops.incident.domain.CodeChange;
+import io.github.aiops.incident.llm.ToolFailureReason;
+import io.github.aiops.incident.llm.ToolValidationException;
 
 import java.time.Instant;
 import java.util.ArrayList;
@@ -33,9 +35,26 @@ public class GitCliDiffTool implements GitDiffTool {
     }
 
     @Override
+    public boolean isRepositoryBacked() {
+        return true;
+    }
+
+    @Override
     public List<CodeChange> getRecentCommitDiffs(String serviceRepository, Instant sinceTimestamp) {
+        return getRecentCommitDiffs(serviceRepository, sinceTimestamp, null);
+    }
+
+    @Override
+    public List<CodeChange> getRecentCommitDiffs(
+            String serviceRepository,
+            Instant sinceTimestamp,
+            Instant untilTimestamp
+    ) {
         if (sinceTimestamp == null) {
-            throw new IllegalArgumentException("sinceTimestamp must not be null.");
+            throw new ToolValidationException(ToolFailureReason.INVALID_TIMESTAMP);
+        }
+        if (untilTimestamp != null && sinceTimestamp.isAfter(untilTimestamp)) {
+            throw new ToolValidationException(ToolFailureReason.TIMESTAMP_OUT_OF_RANGE);
         }
         ServiceRepositoryRegistry.RepositoryTarget target = repositoryRegistry.resolve(serviceRepository);
 
@@ -44,9 +63,12 @@ public class GitCliDiffTool implements GitDiffTool {
                 "--no-color",
                 "--format=%H%x1f%ct%x1e",
                 "--since=" + sinceTimestamp,
-                "--max-count=" + MAX_COMMITS,
-                target.historyRef(),
-                "--"));
+                "--max-count=" + MAX_COMMITS));
+        if (untilTimestamp != null) {
+            logArguments.add("--until=" + untilTimestamp);
+        }
+        logArguments.add(target.historyRef());
+        logArguments.add("--");
         target.allowedPaths().stream()
                 .map(this::literalPathspec)
                 .forEach(logArguments::add);

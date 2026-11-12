@@ -14,9 +14,11 @@ Logging Service over HTTP through `LogQueryTool`; the in-memory log adapter
 remains selectable for tests and demo usage. Git evidence can be retrieved
 from an allowlisted local repository using a read-only Git CLI adapter; the
 in-memory Git adapter remains the default.
-The application supports deterministic `demo` mode and an optional OpenAI-backed
-`openai` mode. OpenAI mode uses host-executed function tools; it is not itself
-an MCP server and does not add a GitHub integration.
+The application supports deterministic `demo` mode and optional LLM analysis
+(`llm` mode, with `openai` retained as a legacy alias). The default provider is
+Groq through its OpenAI-compatible chat-completions API. Tool calls execute in
+the application host; this is not itself an MCP server and does not add GitHub
+integration.
 
 ## 1.1 Maven monorepo structure and implementation status
 
@@ -27,7 +29,7 @@ The repository is a Java 17 Maven reactor with five modules:
 | `service-a` | Service A API and Kafka `LogEvent` producer | 8081 |
 | `service-b` | Service B API and Kafka `LogEvent` producer | 8082 |
 | `logging-service` | Kafka `LogEvent` consumer, MySQL persistence, and event lookup API | 8083 |
-| `incident-analysis-service` | Existing incident API, orchestrator, Detection/Identifier skills, adapters, and optional OpenAI client | 8084 |
+| `incident-analysis-service` | Existing incident API, orchestrator, Detection/Identifier skills, adapters, and optional Groq-compatible LLM client | 8084 |
 | `common-contracts` | Shared `LogEvent`, `IncidentAnalysisEvent`, and `Severity` types | n/a |
 
 `common-contracts` is a plain Java library. The other four modules are
@@ -92,6 +94,32 @@ root-cause hypothesis.
 The orchestrator continues to keep detection and identification as separate
 stages, and proposed fixes remain advisory.
 
+### AI patch proposal stage
+
+In `llm` mode, after IdentifierSkill returns a root cause that has passed its
+Git evidence validation, IncidentOrchestrator invokes PatchGenerationSkill.
+The skill re-queries the configured `GitDiffTool` for the incident service and
+incident lookback, requires the root-cause commit to be present, and supplies
+that commit's bounded diff together with the alert, detection logs, root-cause
+analysis, and incident ID to the existing `StructuredLlmClient`. With the CLI
+adapter, repository context remains read-only and restricted by
+`ServiceRepositoryRegistry` to the configured history reference and service
+paths. The in-memory adapter is not considered repository-backed, so generation
+is rejected without an LLM request when that adapter is selected. The model
+receives no shell, Git, or filesystem tool.
+
+`PatchProposal` is exposed as `IncidentReport.patchProposal` and contains the
+incident ID, source commit ID, summary, target paths, unified diff, validation
+status, and rejection reason. Java checks the output contract, exact source
+commit, safe relative paths, Git-allowlisted service paths, membership in the
+validated root-cause files, unified-diff headers and hunk counts, and that the
+diff modifies exactly the declared target files. Unsafe or malformed proposals
+are rejected with a reason code. `PROPOSED_FOR_REVIEW` only indicates that
+these structural and evidence checks passed; the service does not apply the
+patch or claim that it compiles, passes tests, or is correct. Demo mode does
+not make an LLM request and returns a rejected proposal with a safe reason code.
+Incident reports remain stored in process memory.
+
 ## 2. Core system design and workflow
 
 ### Intended production lifecycle
@@ -118,7 +146,7 @@ The Java application accepts a metric alert at `POST /api/incidents/trigger`.
 `IncidentOrchestrator` invokes `DetectionSkill`, which queries up to 20 recent
 `ERROR` or `CRITICAL` logs through `LogQueryTool`. The default memory adapter
 uses demo entries; HTTP mode retrieves the affected service's configured
-lookback from Logging Service. In OpenAI mode, the model calls the host-provided
+lookback from Logging Service. In LLM mode, the model calls the host-provided
 `query_system_logs` tool, the host queries `LogQueryTool`, and
 the model returns schema-constrained health JSON. If the result is unhealthy,
 `IdentifierSkill` similarly provides `get_recent_commit_diffs`; the host queries
@@ -131,8 +159,8 @@ and are lost when the service restarts.
 
 ## 3. Tool contracts
 
-These are MCP-style contracts for possible future MCP integration. OpenAI mode
-uses equivalent OpenAI function-calling definitions over the existing Java
+These are MCP-style contracts for possible future MCP integration. LLM mode
+uses OpenAI-compatible function-calling definitions over the existing Java
 interfaces. The project does not implement the MCP protocol. The HTTP
 `LogQueryTool` adapter connects to the Logging Service. Git queries use the
 in-memory adapter by default, or the local read-only Git CLI adapter when
@@ -161,7 +189,7 @@ configured.
 implemented by `InMemoryLogQueryTool` in memory mode and
 `LoggingServiceLogQueryTool` in HTTP mode. The HTTP adapter calls the Logging
 Service recent endpoint, maps results to `LogEntry`, filters minimum severity,
-sorts newest first, and returns at most 20 entries. In OpenAI mode, the host
+sorts newest first, and returns at most 20 entries. In LLM mode, the host
 further truncates each message to 2,000 characters before returning the query
 result to the model.
 
@@ -197,12 +225,12 @@ only local, read-only commands against the configured ref and allowed pathspecs.
 Results are bounded to five commits, 4,000 diff characters per change, and
 limited command output/time. Sensitive filenames are excluded and common
 credential formats are redacted. No changes are made to the repository.
-OpenAI mode limits each response to five changes, 50 paths and 4,000 diff
+LLM mode limits each response to five changes, 50 paths and 4,000 diff
 characters per change; commit messages are capped at 500 characters.
 
 ## 4. Skill prompting and structured outputs
 
-Demo mode uses deterministic Java logic. OpenAI mode uses the following prompt
+Demo mode uses deterministic Java logic. LLM mode uses the following prompt
 behavior with host-executed tools and schema-constrained JSON. Tool execution
 remains in the host and only relevant, bounded results are returned to the model.
 
@@ -258,7 +286,8 @@ values, not findings about a real deployment.
 | `IncidentOrchestrator` | Runs detection, conditionally runs identification, stores reports |
 | `DetectionSkill` | Runs deterministic demo checks or asks the LLM to query logs and return structured health JSON |
 | `IdentifierSkill` | Returns a demo hypothesis or asks the LLM to inspect diffs and return structured analysis |
-| `StructuredLlmClient` | OpenAI function-calling loop with JSON-schema response handling |
+| `StructuredLlmClient` | Provider-independent boundary for structured LLM analysis |
+| `OpenAiCompatibleStructuredLlmClient` | OpenAI-compatible chat-completions, tool-call, and strict JSON-schema client; defaults to Groq |
 | `LogQueryTool` | Host-side boundary for log queries |
 | `GitDiffTool` | Host-side boundary for Git diffs |
 | `InMemoryLogQueryTool` | Local demo implementation with a 20-entry result limit |
@@ -328,11 +357,13 @@ mvn test
 The `payment-service` demo data is seeded at startup to make the full workflow
 easy to try without external services.
 
-For OpenAI mode, set `OPENAI_API_KEY` and `AIOPS_ANALYSIS_MODE=openai` in the
-terminal before starting the app. The model defaults to `gpt-4o-mini`; override
-it with `OPENAI_MODEL`. OpenAI mode sends the alert and bounded tool results to
-the configured endpoint and may incur API charges. Demo mode makes no model
-calls.
+For LLM mode, set `AIOPS_ANALYSIS_MODE=llm` and `GROQ_API_KEY` before starting
+the app. The defaults are `GROQ_BASE_URL=https://api.groq.com/openai/v1` and
+`GROQ_MODEL=openai/gpt-oss-120b`. Provider-neutral overrides are
+`AIOPS_LLM_API_KEY`, `AIOPS_LLM_BASE_URL`, and `AIOPS_LLM_MODEL`; provider
+label defaults to `AIOPS_LLM_PROVIDER=groq`. LLM mode sends the alert and
+bounded tool results to the configured endpoint. Demo mode makes no model
+calls. Never store API keys in source code.
 
 ## 9. Next implementation steps
 
